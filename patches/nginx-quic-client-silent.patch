@@ -1,0 +1,278 @@
+nginx-quic-client-silent.patch  (applies to nginx 1.31.8 as bundled in OpenResty 1.31.8.1,
+after nginx-quic-exiting-worker.patch and nginx-quic-send-slice.patch)
+
+HTTP/3: a connection whose client cannot be heard any more is closed, so that the browser
+moves to HTTP/2 at once instead of waiting.
+
+Problem (seen on production on 2026-11-11, on two phones on two mobile networks): while an
+app of the phone uploads over TCP (the Nextcloud app), nothing the browser of the same
+phone sends over UDP arrives at the server. Other TCP connections of the phone pass within
+a second, UDP passes only in the second in which an upload chunk ends, about every 20 s;
+what the server sends still reaches the phone. Firefox keeps waiting on its HTTP/3
+connection: the requests of the player hang, most are given up, and Firefox moved the
+video to HTTP/2 by itself only after four minutes. There it played, during the upload.
+Reproduced with Firefox ESR 153 in lab/browsers/run-blackhole.sh (UDP of
+the browser's machine cut for 60 s, a 340 KB piece requested every 2 s):
+
+    server as it was          30 s without an answer, then 15 requests fail, then HTTP/2
+    server closes after 5 s   the 2 waiting requests are answered over HTTP/2 after
+                              1.8 and 3.8 s, nothing fails
+
+The reason for the 30 s: a client notices only by its own idle timeout that it is not
+heard, and every packet the server sends (it repeats what is not acknowledged) starts that
+timeout again.
+
+Change: new directive
+
+    quic_silent_timeout time;       context http, server; default 0 = off
+
+read, like the other QUIC settings, from the default server of the listener. With a time
+set, each connection is looked at when nothing has arrived from its client for half that
+time:
+ - nothing the server sent is waiting for an acknowledgement: the server asks (PING), so
+   that there is something the client has to answer. At most 15 times in a row without a
+   request of the client in between; a client that is merely idle is then left alone;
+ - nothing has arrived for the whole time and two probe timeouts have passed without an
+   acknowledgement: the connection is closed the way a reload closes it (GOAWAY and
+   CONNECTION_CLOSE with H3_NO_ERROR). The browser repeats the requests that were waiting.
+A client that answers notices nothing. Without the directive not one line of this runs.
+
+Files: ngx_event_quic.h (the setting), ngx_http_v3_module.c (the directive),
+ngx_event_quic_connection.h (state), ngx_event_quic.c (timer, close),
+ngx_event_quic_streams.c (a request of the client starts the count of questions again).
+
+diff -ruN a/src/event/quic/ngx_event_quic.c b/src/event/quic/ngx_event_quic.c
+--- a/src/event/quic/ngx_event_quic.c
++++ b/src/event/quic/ngx_event_quic.c
+@@ -16,6 +16,7 @@
+ static ngx_int_t ngx_quic_handle_stateless_reset(ngx_connection_t *c,
+     ngx_quic_header_t *pkt);
+ static void ngx_quic_close_handler(ngx_event_t *ev);
++static void ngx_quic_live_handler(ngx_event_t *ev);
+ 
+ static ngx_int_t ngx_quic_handle_datagram(ngx_connection_t *c, ngx_buf_t *b,
+     ngx_quic_conf_t *conf);
+@@ -288,6 +289,11 @@
+     qc->key_update.data = c;
+     qc->key_update.handler = ngx_quic_keys_update;
+ 
++    qc->live.log = c->log;
++    qc->live.data = c;
++    qc->live.handler = ngx_quic_live_handler;
++    qc->recv_time = ngx_current_msec;
++
+     qc->conf = conf;
+ 
+     if (ngx_quic_init_transport_params(&qc->tp, conf) != NGX_OK) {
+@@ -467,10 +473,116 @@
+     qc->send_timer_set = 0;
+     ngx_add_timer(rev, qc->tp.max_idle_timeout);
+ 
++    /* local: the client was heard; look again when it has been quiet */
++    qc->recv_time = ngx_current_msec;
++
++    if (qc->conf->silent_timeout && qc->streams.initialized && !qc->closing) {
++        ngx_add_timer(&qc->live, qc->conf->silent_timeout / 2);
++    }
++
+     ngx_quic_connstate_dbg(c);
+ }
+ 
+ 
++/*
++ * local: a client that cannot be heard any more (quic_silent_timeout).
++ *
++ * Seen on 2026-11-11 on two phones on two mobile networks: while an app of the
++ * phone uploads over TCP, nothing the browser of the same phone sends over UDP
++ * gets out; what the server sends still arrives.  The browser (Firefox) kept
++ * waiting on its HTTP/3 connection: requests hung for as long as the upload
++ * ran, the player gave up.  A browser moves to HTTP/2 over TCP, which the
++ * phone does let through, as soon as the server closes the connection: the
++ * requests that were waiting are repeated there by the browser itself.
++ *
++ * So: when nothing has arrived from the client for half the time and nothing
++ * the server sent waits for an acknowledgement, the server asks (PING), at
++ * most NGX_QUIC_LIVE_PROBES times in a row without a request in between, so
++ * that an idle client is left alone.  When nothing has arrived for the whole
++ * time and two probe timeouts have passed without an acknowledgement, the
++ * connection is closed the way a reload closes it: GOAWAY where there is
++ * HTTP/3, then CONNECTION_CLOSE without an error.
++ *
++ * Nothing changes for a client that answers, and nothing at all while the
++ * directive is not set.
++ */
++
++static void
++ngx_quic_live_handler(ngx_event_t *ev)
++{
++    ngx_msec_t              now, silent, limit;
++    ngx_connection_t       *c;
++    ngx_quic_frame_t       *f;
++    ngx_quic_send_ctx_t    *ctx;
++    ngx_quic_connection_t  *qc;
++
++    c = ev->data;
++    qc = ngx_quic_get_connection(c);
++
++    limit = qc->conf->silent_timeout;
++
++    if (limit == 0 || qc->closing || !qc->streams.initialized) {
++        return;
++    }
++
++    now = ngx_current_msec;
++    silent = now - qc->recv_time;
++
++    if (silent < limit / 2) {
++        ngx_add_timer(ev, limit / 2 - silent);
++        return;
++    }
++
++    ctx = ngx_quic_get_send_ctx(qc, NGX_QUIC_ENCRYPTION_APPLICATION);
++
++    if (silent >= limit && qc->pto_count >= 2) {
++
++        ngx_log_error(NGX_LOG_INFO, c->log, 0,
++                      "quic client silent for %M ms, closing", silent);
++
++        if (qc->conf->shutdown) {
++            qc->conf->shutdown(c);
++        }
++
++        if (!qc->close.posted) {
++            /* requests are open: they cannot be delivered */
++            ngx_quic_finalize_connection(c,
++                                     qc->shutdown ? qc->shutdown_code
++                                                  : NGX_QUIC_ERR_NO_ERROR,
++                                     "client not responding");
++        }
++
++        return;
++    }
++
++    if (ngx_queue_empty(&ctx->sent)) {
++
++        /*
++         * nothing waits for an acknowledgement, so nothing would show
++         * that the client cannot be heard
++         */
++
++        if (qc->live_probes >= NGX_QUIC_LIVE_PROBES) {
++            return;
++        }
++
++        f = ngx_quic_alloc_frame(c);
++        if (f == NULL) {
++            return;
++        }
++
++        f->level = ctx->level;
++        f->type = NGX_QUIC_FT_PING;
++
++        ngx_quic_queue_frame(qc, f);
++
++        qc->live_probes++;
++    }
++
++    ngx_add_timer(ev, silent < limit ? limit - silent : 500);
++}
++
++
+ void
+ ngx_quic_close_connection(ngx_connection_t *c, ngx_int_t rc)
+ {
+@@ -575,6 +687,10 @@
+         ngx_del_timer(&qc->pto);
+     }
+ 
++    if (qc->live.timer_set) {
++        ngx_del_timer(&qc->live);
++    }
++
+     if (qc->path_validation.timer_set) {
+         ngx_del_timer(&qc->path_validation);
+     }
+diff -ruN a/src/event/quic/ngx_event_quic_connection.h b/src/event/quic/ngx_event_quic_connection.h
+--- a/src/event/quic/ngx_event_quic_connection.h
++++ b/src/event/quic/ngx_event_quic_connection.h
+@@ -62,6 +62,12 @@
+  */
+ #define NGX_QUIC_EXITING_GRACE               3000 /* ms */
+ 
++/*
++ * local: how often in a row a client that has nothing to say is asked
++ * whether it can still be heard (quic_silent_timeout, ngx_event_quic.c)
++ */
++#define NGX_QUIC_LIVE_PROBES                 15
++
+ #define NGX_QUIC_UNSET_PN                    (uint64_t) -1
+ 
+ /*  0-RTT and 1-RTT data exist in the same packet number space,
+@@ -261,6 +267,10 @@
+     ngx_event_t                       close;
+     ngx_event_t                       path_validation;
+     ngx_event_t                       key_update;
++    ngx_event_t                       live;          /* local */
++
++    ngx_msec_t                        recv_time;     /* local: last packet */
++    ngx_uint_t                        live_probes;   /* local */
+ 
+     ngx_msec_t                        last_cc;
+ 
+diff -ruN a/src/event/quic/ngx_event_quic.h b/src/event/quic/ngx_event_quic.h
+--- a/src/event/quic/ngx_event_quic.h
++++ b/src/event/quic/ngx_event_quic.h
+@@ -85,6 +85,7 @@
+     ngx_flag_t                     disable_active_migration;
+     ngx_msec_t                     handshake_timeout;
+     ngx_msec_t                     idle_timeout;
++    ngx_msec_t                     silent_timeout;   /* local, 0 = off */
+     ngx_str_t                      host_key;
+     size_t                         stream_buffer_size;
+     ngx_uint_t                     max_concurrent_streams_bidi;
+diff -ruN a/src/event/quic/ngx_event_quic_streams.c b/src/event/quic/ngx_event_quic_streams.c
+--- a/src/event/quic/ngx_event_quic_streams.c
++++ b/src/event/quic/ngx_event_quic_streams.c
+@@ -1291,6 +1291,8 @@
+     qc = ngx_quic_get_connection(c);
+     f = &frame->u.stream;
+ 
++    qc->live_probes = 0;    /* local: the client is using the connection */
++
+     if ((f->stream_id & NGX_QUIC_STREAM_UNIDIRECTIONAL)
+         && (f->stream_id & NGX_QUIC_STREAM_SERVER_INITIATED))
+     {
+diff -ruN a/src/http/v3/ngx_http_v3_module.c b/src/http/v3/ngx_http_v3_module.c
+--- a/src/http/v3/ngx_http_v3_module.c
++++ b/src/http/v3/ngx_http_v3_module.c
+@@ -64,6 +64,13 @@
+       offsetof(ngx_http_v3_srv_conf_t, quic.gso_enabled),
+       NULL },
+ 
++    { ngx_string("quic_silent_timeout"),
++      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_msec_slot,
++      NGX_HTTP_SRV_CONF_OFFSET,
++      offsetof(ngx_http_v3_srv_conf_t, quic.silent_timeout),
++      NULL },
++
+     { ngx_string("quic_host_key"),
+       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+       ngx_http_quic_host_key,
+@@ -206,6 +213,7 @@
+     h3scf->quic.max_concurrent_streams_uni = NGX_HTTP_V3_MAX_UNI_STREAMS;
+     h3scf->quic.retry = NGX_CONF_UNSET;
+     h3scf->quic.gso_enabled = NGX_CONF_UNSET;
++    h3scf->quic.silent_timeout = NGX_CONF_UNSET_MSEC;
+     h3scf->quic.stream_close_code = NGX_HTTP_V3_ERR_NO_ERROR;
+     h3scf->quic.stream_reject_code_bidi = NGX_HTTP_V3_ERR_REQUEST_REJECTED;
+     h3scf->quic.active_connection_id_limit = NGX_CONF_UNSET_UINT;
+@@ -243,6 +251,8 @@
+ 
+     ngx_conf_merge_value(conf->quic.retry, prev->quic.retry, 0);
+     ngx_conf_merge_value(conf->quic.gso_enabled, prev->quic.gso_enabled, 0);
++    ngx_conf_merge_msec_value(conf->quic.silent_timeout,
++                              prev->quic.silent_timeout, 0);
+ 
+     ngx_conf_merge_str_value(conf->quic.host_key, prev->quic.host_key, "");
+ 

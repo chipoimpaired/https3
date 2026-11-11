@@ -1,0 +1,15 @@
+user_pref("network.http.http3.enable", true);
+user_pref("network.http.http3.alt-svc-mapping-for-testing", "h3test.example.org;h3=:443");
+user_pref("network.dns.disableIPv6", true);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("app.update.auto", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("network.captive-portal-service.enabled", false);
+user_pref("network.connectivity-service.enabled", false);
+user_pref("extensions.update.enabled", false);
+user_pref("browser.safebrowsing.malware.enabled", false);
+user_pref("browser.safebrowsing.phishing.enabled", false);

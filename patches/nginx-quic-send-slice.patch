@@ -1,0 +1,169 @@
+nginx-quic-send-slice.patch  (applies to nginx 1.31.8 as bundled in OpenResty 1.31.8.1)
+
+HTTP/3: a large stream buffer no longer lets one response hold back the others.
+
+Problem (reproduced on 2026-11-11 with this image): nginx uses http3_stream_buffer_size
+for two things.  It is the receive window of every stream, which limits an upload to one
+buffer per round trip, and it is the amount of response data one stream may have written but
+not yet acknowledged.  All streams of a connection send through one first-come, first-served
+queue, so the second use decides how long one response can hold back the others.  This edge
+needs 2m for uploads (64k is 370 KB/s at 170 ms round trip).  With 2m every large response
+put 2 MB into the queue at once, and on a slow link everything behind it waited: on a phone
+on mobile data a PeerTube audio stream paused for 14 s when a Nextcloud page was opened in
+the same browser (the browser uses one connection for both sites).
+
+What the patch does (one file, ngx_event_quic_streams.c): the amount a stream may have
+unacknowledged is no longer the buffer size but what the path delivers in a short time:
+
+    slice = congestion window * span / smoothed round trip time
+    span  = 250 ms, or two base round trips if that is longer
+    64k <= slice <= http3_stream_buffer_size
+
+  - On a fast path the slice reaches the configured size after a few round trips: nothing
+    changes (30 ms round trip: slice = 8 x window).
+  - While a path is not queueing, the slice is at least twice the congestion window, so a
+    single transfer always fills the window and its speed is unchanged.
+  - On a slow or queueing path the slice shrinks towards 64k, nginx's own default buffer:
+    responses take turns in pieces of about a quarter of a second instead of 2 MB.
+  - It never goes below 64k, so no stream gets less than it does with stock nginx defaults,
+    and never above the configured size.
+  - The receive side is untouched: uploads keep the full window.
+A stream that stopped at its slice is woken by the next acknowledgement of its own data
+that brings it below the slice (stock nginx: when it had been exactly full).
+
+Measured in the staging lab (lab/h3lab.py).  "Phone" link: 170 ms round trip,
+2 Mbit/s each way, 750 KB bottleneck queue.  One connection; a player fetches a 160 KB piece
+every 4 s (1.0 s each when alone); meanwhile a page of 250 files, 9.6 MB, with four script
+bundles of 1.2 to 2.4 MB is loaded 8 files at a time.  Longest time for one piece:
+
+    stock nginx, buffer 2m      15.6 s
+    stock nginx, buffer 64k      7.4 s    (but uploads and downloads limited to 64k per round trip)
+    this patch,  buffer 2m       8.7 s
+    HTTP/2 through the same edge 14.8 s
+
+Speed of one 100 MB transfer, HTTP/3, without and with the patch (sha256 of every body checked):
+
+    30 ms round trip    download 53.9 -> 54.0 MB/s    upload 34.1 -> 34.4 MB/s
+    170 ms round trip   download  9.9 ->  9.9 MB/s    upload  6.5 ->  6.5 MB/s
+    phone link, 4 MB    18.1 -> 17.9 s
+
+What it does not change: when many responses are in progress at once on a slow link, each
+gets its share of the link and no more (pages of small files, 8 / 20 / 256 at a time: 4.5 /
+7.8 / 17.9 s without, 4.6 / 7.2 / 19.9 s with; HTTP/2: 17.8 s for the last).  nginx has no
+HTTP/3 priorities, and two sites that share one connection share one congestion window.
+
+diff -ruN a/src/event/quic/ngx_event_quic_streams.c b/src/event/quic/ngx_event_quic_streams.c
+--- a/src/event/quic/ngx_event_quic_streams.c
++++ b/src/event/quic/ngx_event_quic_streams.c
+@@ -12,6 +12,17 @@
+ 
+ #define NGX_QUIC_STREAM_GONE     (void *) -1
+ 
++/*
++ * send slice (local patch nginx-quic-send-slice.patch): how much data one stream
++ * may have written but not yet acknowledged.  Stock nginx uses the stream buffer
++ * size for this, so a large buffer (needed as the receive window for uploads) also
++ * let every response queue that much ahead of all other streams of the connection.
++ * Here the amount follows what the path delivers in NGX_QUIC_SEND_SLICE_TIME, never
++ * less than the stock default buffer (64k) and never more than the configured one.
++ */
++#define NGX_QUIC_SEND_SLICE_MIN   65536
++#define NGX_QUIC_SEND_SLICE_TIME  250
++
+ 
+ static ngx_int_t ngx_quic_do_reset_stream(ngx_quic_stream_t *qs,
+     ngx_uint_t err);
+@@ -31,6 +42,7 @@
+     size_t size);
+ static ngx_chain_t *ngx_quic_stream_send_chain(ngx_connection_t *c,
+     ngx_chain_t *in, off_t limit);
++static uint64_t ngx_quic_send_slice(ngx_quic_connection_t *qc);
+ static ngx_int_t ngx_quic_stream_flush(ngx_quic_stream_t *qs);
+ static void ngx_quic_stream_cleanup_handler(void *data);
+ static ngx_int_t ngx_quic_close_stream(ngx_quic_stream_t *qs);
+@@ -971,7 +983,9 @@
+ 
+     qs->send_state = NGX_QUIC_STREAM_SEND_SEND;
+ 
+-    flow = qs->acked + qc->conf->stream_buffer_size - qs->sent;
++    flow = ngx_quic_send_slice(qc);
++    n = qs->sent - qs->acked;
++    flow = (n < flow) ? flow - n : 0;
+ 
+     if (flow == 0) {
+         wev->ready = 0;
+@@ -1009,6 +1023,43 @@
+ }
+ 
+ 
++static uint64_t
++ngx_quic_send_slice(ngx_quic_connection_t *qc)
++{
++    uint64_t    slice, max;
++    ngx_msec_t  rtt, span;
++
++    max = qc->conf->stream_buffer_size;
++
++    if (max <= NGX_QUIC_SEND_SLICE_MIN) {
++        return max;
++    }
++
++    /*
++     * window / rtt is what the path delivers per millisecond.  The span is at
++     * least two base round trips, so a stream can always keep the congestion
++     * window full while the path is not queueing; once queueing makes the
++     * round trip longer than the span, the slice gets smaller than the window.
++     */
++
++    span = NGX_QUIC_SEND_SLICE_TIME;
++
++    if (qc->min_rtt != NGX_TIMER_INFINITE && 2 * qc->min_rtt > span) {
++        span = 2 * qc->min_rtt;
++    }
++
++    rtt = ngx_max(qc->avg_rtt, 1);
++
++    slice = (uint64_t) qc->congestion.window * span / rtt;
++
++    if (slice < NGX_QUIC_SEND_SLICE_MIN) {
++        return NGX_QUIC_SEND_SLICE_MIN;
++    }
++
++    return ngx_min(slice, max);
++}
++
++
+ static ngx_int_t
+ ngx_quic_stream_flush(ngx_quic_stream_t *qs)
+ {
+@@ -1586,7 +1637,6 @@
+ void
+ ngx_quic_handle_stream_ack(ngx_connection_t *c, ngx_quic_frame_t *f)
+ {
+-    uint64_t                acked;
+     ngx_quic_stream_t      *qs;
+     ngx_quic_connection_t  *qc;
+ 
+@@ -1616,7 +1666,6 @@
+             return;
+         }
+ 
+-        acked = qs->acked;
+         qs->acked += f->u.stream.length;
+ 
+         if (f->u.stream.fin) {
+@@ -1634,9 +1683,12 @@
+                        qs->id, f->u.stream.length, f->u.stream.fin,
+                        qs->sent - qs->acked);
+ 
++        /* send slice: wake a stream that stopped writing at its slice */
++
+         if (qs->connection
+-            && qs->sent - acked == qc->conf->stream_buffer_size
+-            && f->u.stream.length > 0)
++            && !qs->connection->write->ready
++            && f->u.stream.length > 0
++            && qs->sent - qs->acked < ngx_quic_send_slice(qc))
+         {
+             ngx_quic_set_event(qs->connection->write);
+         }

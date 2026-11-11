@@ -1,0 +1,229 @@
+nginx-quic-exiting-worker.patch  (applies to nginx 1.31.8 as bundled in OpenResty 1.31.8.1)
+
+HTTP/3 after an nginx reload, without quic_bpf.
+
+Problem (reproduced on 2026-11-11 with this image, 30 ms round trip): after `nginx -s reload`
+the retired workers keep the QUIC listening sockets open, and the new worker with the same
+number reads the same reuseport UDP socket.  Whichever process calls recvmsg() first gets the
+datagram, so a retired worker takes away datagrams of the new worker's connections.  A retired
+worker lives as long as any of its connections does (a websocket over TCP is enough), up to
+worker_shutdown_timeout (120 s here).  Measured during that window: 4 of 40 new HTTP/3
+requests failed, 16 of 40 needed more than 0.5 s, uploads failed.
+
+What the patch does, in a worker that is shutting down ONLY (ngx_exiting):
+  1. ngx_quic_recvmsg(): if none of the worker's QUIC connections uses the listening socket
+     any more, the worker gives it up (event deleted, descriptor closed in this process) and
+     leaves the datagram that woke it in the queue for the new worker.
+  2. NGX_QUIC_EXITING_GRACE (3 s) after the first datagram the worker sees while shutting
+     down, its remaining QUIC connections are closed (ngx_close_idle_connections() ->
+     ngx_quic_input_handler(), which now closes instead of waiting for the streams once the
+     grace period is over), so the socket is given up shortly after.  Clients retry such
+     HTTP/3 requests on a new connection.  HTTP/1.1 and HTTP/2 connections are not touched
+     and keep the full worker_shutdown_timeout.
+  3. Until then a datagram of a connection the worker does not know is dropped; it used to
+     create a connection object and answer with a stateless reset.
+
+Measured with the patch (same test): with 16 websockets keeping all four retired workers
+alive, 40 of 40 new HTTP/3 requests answered at normal speed and uploads ran at full speed
+during the window.  With HTTP/3, HTTP/2 and HTTP/1.1 transfers in flight at the reload, the
+HTTP/2 and HTTP/1.1 transfers completed, the HTTP/3 ones were closed after the grace period,
+and new HTTP/3 requests kept working.  12 reloads in 36 s under mixed load: no worker crash,
+no descriptor leak, no failed HTTP/1.1 or HTTP/2 request.
+
+Nothing changes for a worker that is not shutting down.  quic_bpf builds are unaffected (the
+listening sockets are closed by ngx_close_listening_sockets() there).
+
+diff -ruN a/src/event/quic/ngx_event_quic.c b/src/event/quic/ngx_event_quic.c
+--- a/src/event/quic/ngx_event_quic.c
++++ b/src/event/quic/ngx_event_quic.c
+@@ -426,7 +426,13 @@
+     if (c->close) {
+         c->close = 0;
+ 
+-        if (!ngx_exiting || !qc->streams.initialized) {
++        /*
++         * local: after the grace period a worker that is shutting down closes
++         * its remaining QUIC connections instead of waiting for their streams,
++         * see ngx_quic_recvmsg()
++         */
++
++        if (!ngx_exiting || !qc->streams.initialized || ngx_quic_exiting_force) {
+             qc->error = NGX_QUIC_ERR_NO_ERROR;
+             qc->error_reason = "graceful shutdown";
+             ngx_quic_close_connection(c, NGX_ERROR);
+diff -ruN a/src/event/quic/ngx_event_quic_connection.h b/src/event/quic/ngx_event_quic_connection.h
+--- a/src/event/quic/ngx_event_quic_connection.h
++++ b/src/event/quic/ngx_event_quic_connection.h
+@@ -56,6 +56,12 @@
+ /* RFC 9002, 6.2.2.  Handshakes and New Paths: kInitialRtt */
+ #define NGX_QUIC_INITIAL_RTT                 333 /* ms */
+ 
++/*
++ * local: how long a worker that is shutting down keeps its remaining QUIC
++ * connections before it closes them and stops reading the listening socket
++ */
++#define NGX_QUIC_EXITING_GRACE               3000 /* ms */
++
+ #define NGX_QUIC_UNSET_PN                    (uint64_t) -1
+ 
+ /*  0-RTT and 1-RTT data exist in the same packet number space,
+@@ -326,4 +332,8 @@
+ #define ngx_quic_connstate_dbg(c)
+ #endif
+ 
++/* local: set once the grace period of a worker that is shutting down is over */
++extern ngx_uint_t  ngx_quic_exiting_force;
++
++
+ #endif /* _NGX_EVENT_QUIC_CONNECTION_H_INCLUDED_ */
+diff -ruN a/src/event/quic/ngx_event_quic_udp.c b/src/event/quic/ngx_event_quic_udp.c
+--- a/src/event/quic/ngx_event_quic_udp.c
++++ b/src/event/quic/ngx_event_quic_udp.c
+@@ -14,6 +14,39 @@
+ static void ngx_quic_close_accepted_connection(ngx_connection_t *c);
+ static ngx_connection_t *ngx_quic_lookup_connection(ngx_listening_t *ls,
+     ngx_str_t *key, struct sockaddr *local_sockaddr, socklen_t local_socklen);
++static void ngx_quic_release_listening(ngx_listening_t *ls,
++    ngx_connection_t *lc);
++
++
++/*
++ * local: QUIC listening sockets of a worker that is shutting down.
++ *
++ * After a reload the retired workers keep the QUIC listening sockets open
++ * (ngx_close_listening_sockets() skips them, their connections receive through
++ * them), and the new worker with the same number reads the very same reuseport
++ * socket.  A datagram is delivered to whichever of the two processes calls
++ * recvmsg() first, so while a retired worker is alive it takes away datagrams
++ * of the new worker's connections: handshakes time out and uploads stall.
++ * A retired worker stays alive for as long as any connection does, a websocket
++ * over TCP included, up to worker_shutdown_timeout.
++ *
++ * Without quic_bpf (which needs privileges the worker must not have) this is
++ * handled here, in the retired worker only:
++ *
++ *  - it gives the socket up as soon as none of its QUIC connections uses it,
++ *    and the datagram that woke it is left in the queue for the new worker;
++ *  - NGX_QUIC_EXITING_GRACE ms after the first datagram it sees while shutting
++ *    down, its remaining QUIC connections are closed (their HTTP/3 requests
++ *    are retried by the client on a new connection), so the socket is given up
++ *    shortly after;
++ *  - meanwhile a datagram of a connection it does not know is dropped: no
++ *    connection is created for it and nothing is sent in reply.
++ */
++
++ngx_uint_t  ngx_quic_exiting_force;
++
++static ngx_uint_t  ngx_quic_exiting_seen;
++static ngx_msec_t  ngx_quic_exiting_since;
+ 
+ 
+ void
+@@ -59,6 +92,37 @@
+     ls = lc->listening;
+     ev->ready = 0;
+ 
++    if (ngx_exiting) {
++
++        if (ls->rbtree.root == ls->rbtree.sentinel) {
++            ngx_quic_release_listening(ls, lc);
++            return;
++        }
++
++        if (!ngx_quic_exiting_seen) {
++            ngx_quic_exiting_seen = 1;
++            ngx_quic_exiting_since = ngx_current_msec;
++
++        } else if (!ngx_quic_exiting_force
++                   && (ngx_msec_int_t) (ngx_current_msec
++                                        - ngx_quic_exiting_since)
++                      >= NGX_QUIC_EXITING_GRACE)
++        {
++            ngx_quic_exiting_force = 1;
++
++            ngx_log_error(NGX_LOG_NOTICE, ev->log, 0,
++                          "quic closing connections of exiting worker on %V",
++                          &ls->addr_text);
++
++            ngx_close_idle_connections((ngx_cycle_t *) ngx_cycle);
++
++            if (ls->rbtree.root == ls->rbtree.sentinel) {
++                ngx_quic_release_listening(ls, lc);
++                return;
++            }
++        }
++    }
++
+     ngx_log_debug2(NGX_LOG_DEBUG_EVENT, ev->log, 0,
+                    "quic recvmsg on %V, ready: %d",
+                    &ls->addr_text, ev->available);
+@@ -213,6 +277,14 @@
+         }
+ #endif
+ 
++        if (ngx_exiting) {
++            /* local: not ours, belongs to the worker that replaced us */
++            ngx_log_debug0(NGX_LOG_DEBUG_EVENT, ev->log, 0,
++                           "quic unknown connection in exiting worker, "
++                           "dropped");
++            goto next;
++        }
++
+ #if (NGX_STAT_STUB)
+         (void) ngx_atomic_fetch_add(ngx_stat_accepted, 1);
+ #endif
+@@ -365,6 +437,54 @@
+ }
+ 
+ 
++static void
++ngx_quic_release_listening(ngx_listening_t *ls, ngx_connection_t *lc)
++{
++    ngx_event_t  *rev;
++
++    rev = lc->read;
++
++    if (rev->active) {
++        if (ngx_event_flags & NGX_USE_EPOLL_EVENT) {
++
++            /*
++             * the socket stays open in the master and in the new worker,
++             * so the event has to be deleted explicitly
++             */
++
++            ngx_del_event(rev, NGX_READ_EVENT, 0);
++
++        } else {
++            ngx_del_event(rev, NGX_READ_EVENT, NGX_CLOSE_EVENT);
++        }
++    }
++
++    if (rev->timer_set) {
++        ngx_del_timer(rev);
++    }
++
++    if (rev->posted) {
++        ngx_delete_posted_event(rev);
++    }
++
++    ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0,
++                  "quic listening %V released by exiting worker",
++                  &ls->addr_text);
++
++    ngx_free_connection(lc);
++
++    lc->fd = (ngx_socket_t) -1;
++
++    if (ngx_close_socket(ls->fd) == -1) {
++        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, ngx_socket_errno,
++                      ngx_close_socket_n " %V failed", &ls->addr_text);
++    }
++
++    ls->fd = (ngx_socket_t) -1;
++    ls->connection = NULL;
++}
++
++
+ static void
+ ngx_quic_close_accepted_connection(ngx_connection_t *c)
+ {
