@@ -7,7 +7,8 @@ that were switched on did nothing. This repository holds what was measured, the 
 the configuration that made it work, and the lab to repeat the measurements.
 
 Everything here was found on one deployment; the numbers are from its staging lab and from
-real phones. Use it as a description of faults to look for, not as a drop-in product.
+tests on a real phone, made many times. Use it as a description of faults to look for, not
+as a drop-in product.
 
 ## The fault that needs a patch: video stops while the same phone uploads
 
@@ -17,10 +18,15 @@ phone uploads over TCP, the video stops. **[ISSUE.md](ISSUE.md) has the full rep
 | cause | fix | result |
 |---|---|---|
 | The server grants the upload 15 MB of TCP receive window, the phone queues 3 MB in itself: round trip 6.1 s | `lua/npm_upload_window.lua`: the window follows what the sender's link carries | round trip 0.2 s, upload speed unchanged |
-| While the TCP upload transmits, the phone lets no UDP out; Firefox keeps waiting on HTTP/3 | `patches/nginx-quic-client-silent.patch`: directive `quic_silent_timeout`, the server closes a connection whose client cannot be heard, the browser retries over HTTP/2 at once | Firefox: 30 s and 15 failed requests before, one request 2 s late and none failed after |
+| While the TCP upload has data queued, the phone's modem or network holds everything the phone sends over UDP (measured on the phone: up to 21.5 s, none lost); Firefox keeps waiting on HTTP/3 | `patches/nginx-quic-client-silent.patch`: directive `quic_silent_timeout`, the server closes a connection whose client cannot be heard, the browser retries over HTTP/2 at once | Firefox: 30 s and 15 failed requests before, one request 2 s late and none failed after |
+| After the close Firefox opens the next HTTP/3 connection (0-RTT) at every chunk end and waits up to 26 s on a handshake that cannot finish | either (`ROOM = false`) `lua/npm_upload_window.lua` notes the address of a client that uploads on a slow line and `conf/server.conf` answers it with `Alt-Svc: clear` until the upload is over | phone: video over HTTP/2 during the upload, upload at full speed, no gap; back on HTTP/3 by itself 36 s after the upload |
+| HTTP/3 itself next to the upload | or (`ROOM = true`, as shipped) `lua/npm_upload_window.lua` holds the upload to about half of what the line carries while another program of the same device talks to the proxy: the phone then lets UDP out | phone: video over HTTP/3 next to the upload, 16 MB in 180 s, no gap; upload 290 instead of 480 KB/s |
 
-On the real phone after both: 56 upload chunks of 10 MB in 20 minutes and, in the same 20
-minutes, 316 media pieces delivered with no aborted request. Before: none during an upload.
+On the real phone: 54 upload chunks of 10 MB in 20 minutes and, in the same 20 minutes, 295
+media pieces delivered with no aborted request. Before: none during an upload. A phone
+holds UDP behind its own TCP upload, so there are two ways to live with it, one constant
+apart: the video goes over HTTP/2 for that time and the upload keeps its speed, or the
+upload is held to about half and the video stays on HTTP/3 (ISSUE.md has the measurements).
 
 ## Other HTTP/3 faults met on the same proxy
 
@@ -51,12 +57,14 @@ minutes, 316 media pieces delivered with no aborted request. Before: none during
 
 ## How it was worked out
 
-By measuring at the proxy while the operator tested with real phones, and by repeating each
-fault in a container lab before and after a change. The work was done with Claude, the AI
+By measuring at the proxy while the operator tested with a real phone, many times, and by
+repeating each fault in a container lab before and after a change. The work was done with
+Claude, the AI
 model of Anthropic, over several sessions. The first fix for the phone fault was proven in
 the lab and still did not help on the phone, because the lab had modelled only a queue;
-measuring the real device again showed the second cause. A lab proves the mechanism you
-modelled, not the device.
+measuring the real device again showed the second cause. The second fix passed the lab and
+the phone and failed two days later on the same phone: the lab dropped packets where a phone
+holds them. A lab proves the mechanism you modelled, not the device.
 
 ## Licence
 

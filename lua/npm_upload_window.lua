@@ -2,7 +2,7 @@
 --
 -- Why (seen on production on 2026-11-11, reproduced in lab/uplink.sh):
 -- while the Nextcloud Android app uploaded (HTTP/1.1, one TCP connection), PeerTube in the
--- browser of the same phone stopped, on two different phones. A sender may have as much
+-- browser of the same phone stopped, in test after test. A sender may have as much
 -- data on its way as the receiver's window allows. Linux sizes that window by itself and,
 -- since a kernel change of 2025 (largest buffer 6 MB -> 32 MB), up to 15 MB; a phone with a 4 Mbit/s uplink then keeps seconds of
 -- upload data queued in its own modem (measured: TCP round trip 6.1 s instead of 0.1 s),
@@ -25,7 +25,7 @@
 -- The idea is the one of RFC 9840 (rLEDBAT): the receiver steers the sender through the
 -- window it advertises; no change on the client.
 --
--- Used from the server blocks (conf/example.conf): request() in the rewrite phase, done() in the log
+-- Used from the server blocks (conf/server.conf): request() in the rewrite phase, done() in the log
 -- phase. Any failure leaves the connection as the kernel made it. To switch it off, remove
 -- the two calls there (or set ENABLED to false here) and reload.
 
@@ -42,6 +42,16 @@ local TICK     = 0.5               -- seconds between two looks at a connection
 local PROBE    = 5                 -- seconds between two tries of a larger window
 local RTT_MAX  = 0.3               -- round trip time used at most, seconds (a first sample
                                    -- taken while the link was already congested is too high)
+local SLOW     = 2 * 1024 * 1024   -- bytes per second: an upload below this is "on a slow line"
+local MARK_TTL = 15                -- seconds a mark outlives the last look at the upload
+-- Room for the sender's HTTP/3 (see room() below). false: the sender's browser is told to
+-- leave HTTP/3 while it uploads (mark() and conf/server.conf) and the upload keeps
+-- its full speed.
+local ROOM      = true
+local ROOM_HEAD = 0.55             -- share of what the line carries that the upload gets then
+local ROOM_HOLD = 30               -- seconds between two tries of what the line carries now
+local ROOM_MIN  = 8 * 1024         -- smallest window in that mode, bytes
+local ROOM_TTL  = 30               -- seconds an address counts as using HTTP/3 after a request
 
 local _M = { version = 1 }
 
@@ -102,6 +112,24 @@ end
 
 local conns, count = {}, 0      -- per worker: connection number -> state
 
+-- "This address is uploading on a slow line" (shared by all workers, conf/http.conf).
+-- Measured on 2026-11-13 with a test phone on 3G (numbered UDP packets sent from the phone
+-- during an upload): the phone's kernel hands them to the modem on time, they reach this
+-- server only in the second in which an upload chunk ends, up to 21 s late, none lost. TCP
+-- acknowledgements of the same phone are not held. So HTTP/3 of that phone cannot work
+-- while it uploads, HTTP/2 can. With the upload held to half its speed UDP did get through,
+-- at that price; the operator chose full upload speed and HTTP/2 for that time.
+-- conf/server.conf therefore answers a marked address with "Alt-Svc: clear" on its
+-- TCP connections: its browser stops trying HTTP/3 (each try cost up to 26 s there) until
+-- the mark has run out, MARK_TTL seconds after the upload; then HTTP/3 is advertised again.
+-- An address is that of a NAT too: other devices behind it use HTTP/2 for that time.
+local function mark(st)
+    local d = ngx.shared.uploading
+    if not ROOM and d and st.ip and st.win and st.peak > 0 and st.peak < SLOW then
+        d:set(st.ip, true, MARK_TTL)
+    end
+end
+
 local function peer_port(fd)
     ilen[0] = 128
     if C.npm_uw_getpeername(fd, peer, ilen) ~= 0 then
@@ -139,7 +167,9 @@ local function info(fd)
     if rt == 0 or rt == 0xffffffff then
         rt = ti.rtt
     end
-    return tonumber(ti.bytes_received), rt / 1e6
+    -- third value: the round trip as the receiver measures it from the sender's timestamp
+    -- echoes; it grows with what the sender has queued in itself (0 without timestamps)
+    return tonumber(ti.bytes_received), rt / 1e6, ti.rcv_rtt / 1e6
 end
 
 local function hold(st, win)
@@ -196,6 +226,78 @@ local function pin(st)
     return st.pin
 end
 
+-- Room for the sender's HTTP/3 (operator's decision of 2026-11-13, after the measurement
+-- above: HTTP/3 has to work on a phone during its own upload too).
+-- The phone lets UDP out only while its TCP upload has nothing queued. A sender that is held
+-- by the receive window below what its line carries sends each packet as it is released by
+-- an acknowledgement and queues nothing; then the UDP of the same phone passes (measured:
+-- delay 0.03 to 0.3 s instead of up to 21 s).
+-- So while the sender's address is using HTTP/3, or another program of that device is
+-- talking to this server at all (both noted by h3() below), its upload is held to
+-- ROOM_HEAD of what the line carries:
+--  * what the line carries: what the upload delivered before it was held; measured again
+--    every ROOM_HOLD seconds by opening the window wider for a second; lowered when the
+--    sender queues although it is held (its round trip, as the receiver sees it from the
+--    timestamp echoes, stays far above the lowest one);
+--  * the window is that share times the round trip.
+-- Without HTTP/3 from that address the upload runs as before, at full speed.
+local function room(st, rate, rr, now)
+    local r = st.room
+    if not r then
+        -- not before the upload has shown what the line carries (two seconds at its own pace)
+        if st.looks < 4 then
+            return false
+        end
+        local carries = math.max(st.peak, rate)
+        if carries <= 0 or carries >= SLOW then
+            return false
+        end
+        r = { carries = carries, queued = 0, wait = 0, measure_at = now + ROOM_HOLD }
+        st.room, st.exp = r, nil
+    end
+    if rr > 0 and (not r.base or rr < r.base) then
+        r.base = rr
+    end
+    -- The window is reckoned, not felt for: share of the line x round trip. (Two versions
+    -- that moved the window by what the upload delivered both went wrong on a real phone on
+    -- 3G: one cut the upload to 30 KB/s, one let it run full again. On such a line neither
+    -- the delivery nor the round trip is steady enough to steer by from look to look.)
+    local rt = math.min(math.max(st.rt or 0, r.base or 0, 0.02), RTT_MAX)
+    if r.measuring then
+        -- the window is open wider for a second: what arrives now is what the line carries
+        r.best = math.max(r.best, rate)
+        r.measuring = r.measuring - 1
+        if r.measuring > 0 then
+            return true
+        end
+        r.measuring = nil
+        if r.best > 0.5 * r.carries then               -- (not a pause of the sender)
+            r.carries = math.min(SLOW, r.best)
+        end
+        r.measure_at, r.queued, r.wait = now + ROOM_HOLD, 0, 2
+    elseif r.wait > 0 then
+        r.wait = r.wait - 1
+    else
+        -- held, and its round trip far above the lowest for two seconds: the line carries
+        -- much less than assumed (only a large rise counts, see above)
+        local queueing = r.base and rr > 0 and rr - r.base > math.max(0.25, 2 * r.base)
+        r.queued = queueing and r.queued + 1 or 0
+        if r.queued >= 4 then
+            r.carries = math.max(16 * 1024, 0.75 * r.carries)
+            r.queued, r.wait = 0, 4
+        elseif now >= r.measure_at and rate >= 0.3 * ROOM_HEAD * r.carries then
+            r.measuring, r.best = 2, 0
+            hold(st, math.max(ROOM_MIN, math.floor(3 * ROOM_HEAD * r.carries * rt)))
+            return true
+        end
+    end
+    local win = math.max(ROOM_MIN, math.floor(ROOM_HEAD * r.carries * rt))
+    if not st.win or math.abs(win - st.win) > 0.05 * st.win then
+        hold(st, win)
+    end
+    return true
+end
+
 tick = function(premature, serial)
     local st = conns[serial]
     if not st then
@@ -208,7 +310,7 @@ tick = function(premature, serial)
     if peer_port(st.fd) ~= st.port then      -- closed, or the number belongs to someone else now
         return forget(serial)
     end
-    local bytes, rt = info(st.fd)
+    local bytes, rt, rr = info(st.fd)
     if not bytes then
         return forget(serial)
     end
@@ -219,6 +321,31 @@ tick = function(premature, serial)
         local rate = got / dt
         st.bytes, st.t = bytes, now
         st.idle = rate > 0 and 0 or st.idle + 1
+        st.rt = rt
+        st.looks = (st.looks or 0) + 1
+        -- the sender's address is using HTTP/3: the upload makes room for it
+        local h3 = ROOM and ngx.shared.h3_recent
+        if h3 and st.ip and st.busy then
+            h3:set("u|" .. st.ip, st.agent, 20)      -- "an upload of this program is running"
+        end
+        if h3 and st.ip and h3:get(st.ip) then
+            if room(st, rate, rr, now) then
+                st.peak = math.max(rate, st.peak * 0.7)
+                st.last = rate
+                if st.busy and st.idle < 8 then
+                    arm(serial, st)
+                else
+                    st.seen = now
+                end
+                return
+            end
+        elseif st.room then
+            -- no HTTP/3 from that address any more: back to the window as before
+            st.room, st.peak = nil, math.max(st.peak, st.room.carries)
+            if st.room == nil and st.win then
+                set(st, st.keep or FREE)
+            end
+        end
         -- the best of the last moments, so that a short pause does not close the window
         st.peak = math.max(rate, st.peak * 0.7)
         local steady = rate < st.last * 1.25 and rate > st.last * 0.8
@@ -281,6 +408,9 @@ tick = function(premature, serial)
             set(st, math.floor(cur * 1.5))
         end
         st.last = rate
+        if st.busy then
+            mark(st)
+        end
     end
     -- goes on while the request is being received; stops by itself if the end of the
     -- request was missed and nothing has arrived for four seconds
@@ -337,7 +467,8 @@ function _M.request()
             end
         end
         st = { fd = fd, port = port, peak = 0, last = 0, idle = 0, seen = now,
-               probe_gap = PROBE, probe_at = now + PROBE }
+               probe_gap = PROBE, probe_at = now + PROBE, ip = ngx.var.remote_addr,
+               agent = ngx.crc32_short(ngx.var.http_user_agent or "") }
         conns[serial] = st
         count = count + 1
     end
@@ -351,6 +482,32 @@ function _M.request()
     st.busy = true
     ngx.ctx.npm_upload_window = serial
     arm(serial, st)
+end
+
+-- Every request (conf/server.conf, rewrite phase). An address counts as "wants
+-- room" for ROOM_TTL seconds after
+--  * an HTTP/3 request from it, or
+--  * any request from it by another program than the one that is uploading from it right
+--    now (another User-Agent): a browser that was pushed to HTTP/2, or one that is about to
+--    start HTTP/3. A new HTTP/3 connection could not even be set up behind a full-speed
+--    upload: the token of a QUIC Retry is valid for 3 s.
+function _M.h3()
+    if not ROOM then
+        return
+    end
+    local d = ngx.shared.h3_recent
+    if not d then
+        return
+    end
+    local addr = ngx.var.remote_addr
+    if ngx.var.server_protocol == "HTTP/3.0" then
+        d:set(addr, true, ROOM_TTL)
+        return
+    end
+    local up = d:get("u|" .. addr)
+    if up and up ~= ngx.crc32_short(ngx.var.http_user_agent or "") then
+        d:set(addr, true, ROOM_TTL)
+    end
 end
 
 function _M.done()

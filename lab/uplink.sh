@@ -13,6 +13,7 @@
 #
 #   uplink.sh up [rate] [queue] [ms one way] [down rate]   default 4mbit 3000k 30 30mbit
 #   uplink.sh up none - <ms one way>   latency only, no rate limit
+#   STARVE=1 uplink.sh up ...          the uplink serves UDP only while TCP has nothing queued (a real phone)
 #   BURST=200k uplink.sh up 100mbit 600k 15 100mbit   a fast line (tbf needs a larger burst there)
 #   uplink.sh run [seconds] [proto]   upload + player (HTTP/3, or 2), prints both results
 #   uplink.sh alone [seconds] [proto] the player without the upload (yardstick)
@@ -44,6 +45,15 @@ case "$1" in
    if [ "$RATE" != none ]; then
      ns $R tc qdisc add dev $UP parent 1:1 handle 10: tbf rate $RATE burst ${BURST:-20k} limit $QUEUE
      ns $R tc qdisc add dev $DN parent 1:1 handle 10: tbf rate $DOWN burst 40k limit 1000k
+     if [ -n "$STARVE" ]; then
+       # As measured on a test phone on 2026-11-13: what the phone sends over UDP gets out
+       # only while its TCP upload has nothing queued, and small TCP packets (the
+       # acknowledgements) have a lane of their own. Three bands under the rate limit:
+       # small TCP first, the rest of TCP, UDP last.
+       ns $R tc qdisc add dev $UP parent 10:1 handle 20: prio bands 3 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+       ns $R tc filter add dev $UP parent 20: protocol ip prio 1 u32 match ip protocol 17 0xff flowid 20:3
+       ns $R tc filter add dev $UP parent 20: protocol ip prio 2 u32 match ip protocol 6 0xff match u16 0x0000 0xff80 at 2 flowid 20:1
+     fi
    fi
    docker exec npm-stage-phone sh -c 'head -c 10485760 /dev/urandom > /tmp/chunk'
    echo "phone link: up $RATE (queue $QUEUE), down $DOWN, $((MS*2)) ms round trip";;

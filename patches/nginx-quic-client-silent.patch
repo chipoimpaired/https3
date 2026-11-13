@@ -4,7 +4,7 @@ after nginx-quic-exiting-worker.patch and nginx-quic-send-slice.patch)
 HTTP/3: a connection whose client cannot be heard any more is closed, so that the browser
 moves to HTTP/2 at once instead of waiting.
 
-Problem (seen on production on 2026-11-11, on two phones on two mobile networks): while an
+Problem (seen on production on 2026-11-11, in test after test on mobile data): while an
 app of the phone uploads over TCP (the Nextcloud app), nothing the browser of the same
 phone sends over UDP arrives at the server. Other TCP connections of the phone pass within
 a second, UDP passes only in the second in which an upload chunk ends, about every 20 s;
@@ -29,13 +29,36 @@ Change: new directive
 read, like the other QUIC settings, from the default server of the listener. With a time
 set, each connection is looked at when nothing has arrived from its client for half that
 time:
- - nothing the server sent is waiting for an acknowledgement: the server asks (PING), so
-   that there is something the client has to answer. At most 15 times in a row without a
-   request of the client in between; a client that is merely idle is then left alone;
- - nothing has arrived for the whole time and two probe timeouts have passed without an
-   acknowledgement: the connection is closed the way a reload closes it (GOAWAY and
-   CONNECTION_CLOSE with H3_NO_ERROR). The browser repeats the requests that were waiting.
+ - the server asks (PING), and once more at three quarters of the time, so that there is
+   something the client has to answer. A client with nothing in progress is asked at most
+   15 times in a row without a request in between; a client that is merely idle is then
+   left alone;
+ - nothing has arrived for the whole time although the server asked twice: the connection
+   is closed the way a reload closes it (GOAWAY and CONNECTION_CLOSE with H3_NO_ERROR).
+   The browser repeats the requests that were waiting.
 A client that answers notices nothing. Without the directive not one line of this runs.
+
+Second version (2026-11-13, build name client-silent-2). The first version sent its
+question only when nothing was waiting for an acknowledgement and closed only after two
+probe timeouts of nginx's loss timer. That failed on production with the very phone it
+was made for: a phone does not drop what the browser sends while the app uploads, it
+holds it and lets it out when an upload chunk ends, up to 20 s later. Every
+acknowledgement that arrives so late is a round trip sample (RFC 9002 section 5 has no
+rule against it), the smoothed round trip time and with it the probe timeout grew to many
+seconds, two probe timeouts no longer fitted into the 20 s between two chunk ends, and the
+connection was never closed: one HTTP/3 connection lived through a whole upload, the
+player's requests reached the server in bursts of 100 and more every 20 s, most of them
+already given up (499), no media was delivered. The lab test of the first version dropped
+the client's packets, it did not hold them, and so did not show this.
+Now the questions are sent by this code at once (they do not wait for the loss timer and
+ignore the congestion window, like its probes), and the time a client has to answer is
+half the configured time or four times the LOWEST round trip seen, whichever is longer,
+and never more than the configured time: late answers cannot raise the lowest round trip,
+and where even the first answer came late the bound holds. A connection whose client is
+not heard is therefore closed after 1 to 1.5 times the configured time (4 to 6 s here).
+Lab (lab/silent-test.sh late: every packet of the client gets out 2.5 s
+late from the handshake on, then none): first version closed after 20.2 s, this one after
+the time given in README.md.
 
 Files: ngx_event_quic.h (the setting), ngx_http_v3_module.c (the directive),
 ngx_event_quic_connection.h (state), ngx_event_quic.c (timer, close),
@@ -64,12 +87,13 @@ diff -ruN a/src/event/quic/ngx_event_quic.c b/src/event/quic/ngx_event_quic.c
      qc->conf = conf;
  
      if (ngx_quic_init_transport_params(&qc->tp, conf) != NGX_OK) {
-@@ -467,10 +473,116 @@
+@@ -467,10 +473,163 @@
      qc->send_timer_set = 0;
      ngx_add_timer(rev, qc->tp.max_idle_timeout);
  
 +    /* local: the client was heard; look again when it has been quiet */
 +    qc->recv_time = ngx_current_msec;
++    qc->live_asked = 0;
 +
 +    if (qc->conf->silent_timeout && qc->streams.initialized && !qc->closing) {
 +        ngx_add_timer(&qc->live, qc->conf->silent_timeout / 2);
@@ -82,7 +106,7 @@ diff -ruN a/src/event/quic/ngx_event_quic.c b/src/event/quic/ngx_event_quic.c
 +/*
 + * local: a client that cannot be heard any more (quic_silent_timeout).
 + *
-+ * Seen on 2026-11-11 on two phones on two mobile networks: while an app of the
++ * Seen on 2026-11-11 in test after test on mobile data: while an app of the
 + * phone uploads over TCP, nothing the browser of the same phone sends over UDP
 + * gets out; what the server sends still arrives.  The browser (Firefox) kept
 + * waiting on its HTTP/3 connection: requests hung for as long as the upload
@@ -90,13 +114,27 @@ diff -ruN a/src/event/quic/ngx_event_quic.c b/src/event/quic/ngx_event_quic.c
 + * phone does let through, as soon as the server closes the connection: the
 + * requests that were waiting are repeated there by the browser itself.
 + *
-+ * So: when nothing has arrived from the client for half the time and nothing
-+ * the server sent waits for an acknowledgement, the server asks (PING), at
-+ * most NGX_QUIC_LIVE_PROBES times in a row without a request in between, so
-+ * that an idle client is left alone.  When nothing has arrived for the whole
-+ * time and two probe timeouts have passed without an acknowledgement, the
++ * So: when nothing has arrived from the client for half the time, the server
++ * asks (PING), and again at three quarters of the time.  A client with
++ * nothing in progress is asked at most NGX_QUIC_LIVE_PROBES times in a row
++ * without a request in between, so that an idle client is left alone.  When
++ * nothing has arrived for the whole time although the server asked twice, the
 + * connection is closed the way a reload closes it: GOAWAY where there is
 + * HTTP/3, then CONNECTION_CLOSE without an error.
++ *
++ * The questions are sent here and do not wait for the probe timeout, and the
++ * time to answer does not follow the smoothed round trip time (second
++ * version, 2026-11-13).  A phone does not drop what the browser sends while
++ * the app uploads, it holds it and lets it out when an upload chunk ends, up
++ * to 20 s later.  Every acknowledgement that arrives that late is taken as a
++ * round trip sample, so the smoothed round trip time and the probe timeout
++ * grow to many seconds; the first version waited for two probe timeouts and
++ * then never closed such a connection (seen on production: one connection
++ * lived through every 20 s silence of an upload, the player's requests
++ * arrived in bursts of 100 and more, already given up).  The lowest round
++ * trip seen cannot be raised by late answers: a client gets half the time or
++ * four of those to answer, whichever is longer, and never more than the
++ * whole time.  So a connection is closed after 1 to 1.5 times the time.
 + *
 + * Nothing changes for a client that answers, and nothing at all while the
 + * directive is not set.
@@ -105,7 +143,7 @@ diff -ruN a/src/event/quic/ngx_event_quic.c b/src/event/quic/ngx_event_quic.c
 +static void
 +ngx_quic_live_handler(ngx_event_t *ev)
 +{
-+    ngx_msec_t              now, silent, limit;
++    ngx_msec_t              now, silent, limit, wait;
 +    ngx_connection_t       *c;
 +    ngx_quic_frame_t       *f;
 +    ngx_quic_send_ctx_t    *ctx;
@@ -130,8 +168,21 @@ diff -ruN a/src/event/quic/ngx_event_quic.c b/src/event/quic/ngx_event_quic.c
 +
 +    ctx = ngx_quic_get_send_ctx(qc, NGX_QUIC_ENCRYPTION_APPLICATION);
 +
-+    if (silent >= limit && qc->pto_count >= 2) {
++    /*
++     * the time a client has to answer the first question: not taken from
++     * the smoothed round trip time, which late answers make too long
++     */
 +
++    wait = limit / 2;
++
++    if (qc->min_rtt != NGX_TIMER_INFINITE && 4 * qc->min_rtt > wait) {
++        /* a first answer that came late makes even the lowest one long */
++        wait = ngx_min(4 * qc->min_rtt, limit);
++    }
++
++    if (silent >= limit && qc->live_asked >= 2
++        && now - qc->live_ask_time >= wait)
++    {
 +        ngx_log_error(NGX_LOG_INFO, c->log, 0,
 +                      "quic client silent for %M ms, closing", silent);
 +
@@ -150,16 +201,26 @@ diff -ruN a/src/event/quic/ngx_event_quic.c b/src/event/quic/ngx_event_quic.c
 +        return;
 +    }
 +
-+    if (ngx_queue_empty(&ctx->sent)) {
++    if (qc->live_asked == 0 && ngx_queue_empty(&ctx->sent)) {
 +
 +        /*
-+         * nothing waits for an acknowledgement, so nothing would show
-+         * that the client cannot be heard
++         * nothing waits for an acknowledgement: a client that has nothing
++         * to say.  It is asked only so often in a row.
 +         */
 +
 +        if (qc->live_probes >= NGX_QUIC_LIVE_PROBES) {
 +            return;
 +        }
++
++        qc->live_probes++;
++    }
++
++    if (qc->live_asked < NGX_QUIC_LIVE_ASKS) {
++
++        /*
++         * sent at once, like a probe of the loss timer: the congestion
++         * window may be full of what the client did not acknowledge
++         */
 +
 +        f = ngx_quic_alloc_frame(c);
 +        if (f == NULL) {
@@ -168,20 +229,29 @@ diff -ruN a/src/event/quic/ngx_event_quic.c b/src/event/quic/ngx_event_quic.c
 +
 +        f->level = ctx->level;
 +        f->type = NGX_QUIC_FT_PING;
++        f->ignore_congestion = 1;
 +
-+        ngx_quic_queue_frame(qc, f);
++        if (ngx_quic_frame_sendto(c, f, 0, qc->path) == NGX_ERROR) {
++            ngx_quic_close_connection(c, NGX_ERROR);
++            return;
++        }
 +
-+        qc->live_probes++;
++        if (qc->live_asked == 0) {
++            qc->live_ask_time = now;
++        }
++
++        qc->live_asked++;
 +    }
 +
-+    ngx_add_timer(ev, silent < limit ? limit - silent : 500);
++    ngx_add_timer(ev, silent < limit ? ngx_min(limit / 4, limit - silent)
++                                     : 500);
 +}
 +
 +
  void
  ngx_quic_close_connection(ngx_connection_t *c, ngx_int_t rc)
  {
-@@ -575,6 +687,10 @@
+@@ -575,6 +734,10 @@
          ngx_del_timer(&qc->pto);
      }
  
@@ -195,7 +265,7 @@ diff -ruN a/src/event/quic/ngx_event_quic.c b/src/event/quic/ngx_event_quic.c
 diff -ruN a/src/event/quic/ngx_event_quic_connection.h b/src/event/quic/ngx_event_quic_connection.h
 --- a/src/event/quic/ngx_event_quic_connection.h
 +++ b/src/event/quic/ngx_event_quic_connection.h
-@@ -62,6 +62,12 @@
+@@ -62,6 +62,15 @@
   */
  #define NGX_QUIC_EXITING_GRACE               3000 /* ms */
  
@@ -205,16 +275,21 @@ diff -ruN a/src/event/quic/ngx_event_quic_connection.h b/src/event/quic/ngx_even
 + */
 +#define NGX_QUIC_LIVE_PROBES                 15
 +
++/* local: questions to a client that is not heard before it is given up */
++#define NGX_QUIC_LIVE_ASKS                   4
++
  #define NGX_QUIC_UNSET_PN                    (uint64_t) -1
  
  /*  0-RTT and 1-RTT data exist in the same packet number space,
-@@ -261,6 +267,10 @@
+@@ -261,6 +270,12 @@
      ngx_event_t                       close;
      ngx_event_t                       path_validation;
      ngx_event_t                       key_update;
 +    ngx_event_t                       live;          /* local */
 +
 +    ngx_msec_t                        recv_time;     /* local: last packet */
++    ngx_msec_t                        live_ask_time; /* local */
++    ngx_uint_t                        live_asked;    /* local */
 +    ngx_uint_t                        live_probes;   /* local */
  
      ngx_msec_t                        last_cc;

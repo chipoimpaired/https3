@@ -8,6 +8,13 @@ patches/nginx-quic-client-silent.patch). Runs in the client container; the
   cut     one request, UDP out is cut, a second request is sent into the void: when and
           how the server closes
   cutdl   the same in the middle of a 60 MB download
+  late    every packet of the client, from the first one of the handshake on, is held for
+          2.5 s before it gets out (silent-test.sh late), as from a phone that lets UDP out
+          only now and then; after ten requests nothing gets out any more. The server's
+          round trip estimate is then seconds long. When the server closes is measured by
+          silent-test.sh on the server's side: this client waits three of its own (equally
+          long) probe timeouts before it reports a close, so its own number is of no use.
+          (Not more than 2.5 s: the token of a QUIC Retry is valid for 3 s.)
 """
 import asyncio, json, os, ssl, sys, time
 from aioquic.asyncio.client import connect
@@ -53,7 +60,7 @@ def pings(log, since):
     out = []
     for tr in log.to_dict()["traces"]:
         for ev in tr["events"]:
-            if ev["name"] == "transport:packet_received" and any(f["frame_type"] == "ping" for f in ev["data"].get("frames", [])):
+            if ev["name"].endswith(":packet_received") and any(f["frame_type"] == "ping" for f in ev["data"].get("frames", [])):
                 out.append(ev["time"] / 1000)
     return out
 
@@ -80,8 +87,11 @@ async def main(mode):
         if mode == "cutdl":
             cl.get("/download?bytes=60000000")
             await asyncio.sleep(1.0)
+        if mode == "late":
+            for i in range(9):
+                await cl.get("/headers?silent-late-%d" % i)
         open("/tmp/silent_ready", "w").write("x")          # silent-test.sh cuts UDP out now
-        for _ in range(100):
+        for _ in range(1200 if mode == "late" else 100):
             if os.path.exists("/tmp/silent_cut"):
                 break
             await asyncio.sleep(0.05)
@@ -93,6 +103,8 @@ async def main(mode):
             if cl.closed:
                 break
             await asyncio.sleep(0.05)
+        if mode == "late":
+            os._exit(0)
         if cl.closed:
             print(json.dumps(dict(mode=mode, closed_by_server_after_s=round(cl.closed[0] - t_cut, 1),
                                   error_code=hex(cl.closed[1]), reason=cl.closed[2],
